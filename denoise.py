@@ -55,6 +55,8 @@ DEFAULTS = dict(
     h_pow=3.0,
     h_z0=2.5,
     h_fmax=2500.0,
+    spp_w=0.0, spp_sigma=15.0, spp_xi_db=15.0, spp_alpha=0.8,
+    spp_bias=1.0, spp_ns0=0.0, spp_ns_scale=1.0,
 )
 
 # 튜닝 결과(best_params.json)가 이 파일 옆에 있으면 자동으로 기본값에 반영
@@ -63,7 +65,7 @@ if os.path.exists(_CFG):
     DEFAULTS.update(json.load(open(_CFG)))
 
 
-def _noise_psd(P, p):
+def _noise_psd_base(P, p):
     S = uniform_filter1d(P, 3, axis=0, mode="nearest")
     S = uniform_filter1d(S, 5, axis=1, mode="nearest")
     win = int(min(p["min_win"], P.shape[1]))
@@ -81,6 +83,42 @@ def _noise_psd(P, p):
         avg = num / np.maximum(den, 1e-9)
         noise = np.maximum(lam * avg + (1 - lam) * n_min, 1e-14)
     return noise * p["noise_scale"]
+
+
+def _spp_pass(P, N0, xi_db, alpha, bias):
+    """Gerkmann-Hendriks 계열 SPP 기반 잡음 파워 추적(한 방향)."""
+    xi = 10 ** (xi_db / 10)
+    k = xi / (1 + xi)
+    sig = N0[:, 0].copy()
+    pbar = np.full(P.shape[0], 0.5)
+    out = np.empty_like(P)
+    for t in range(P.shape[1]):
+        post = 1.0 / (1.0 + (1 + xi) * np.exp(-(P[:, t] / np.maximum(sig, 1e-14)) * k))  # P(음성 존재|y)
+        pbar = 0.9 * pbar + 0.1 * post
+        post = np.where(pbar > 0.99, np.minimum(post, 0.99), post)                       # 정체 방지
+        en = (1 - post) * P[:, t] + post * sig
+        sig = np.maximum(alpha * sig + (1 - alpha) * en, 1e-14)
+        out[:, t] = sig
+    return out * bias
+
+
+def _noise_psd(P, p):
+    """기존 최소통계 추정(N0)과 양방향 SPP 추정을 로그 영역에서 혼합."""
+    N0 = _noise_psd_base(P, p)
+    w0 = p["spp_w"]
+    if w0 <= 0:
+        return N0
+    a, xdb, b = p["spp_alpha"], p["spp_xi_db"], p["spp_bias"]
+    f = _spp_pass(P, N0, xdb, a, b)
+    r = _spp_pass(P[:, ::-1], N0[:, ::-1], xdb, a, b)[:, ::-1]
+    Ns = gaussian_filter1d(np.exp(0.5 * (np.log(f) + np.log(r))), p["spp_sigma"], axis=1, mode="nearest")
+    K = P.shape[0]
+    e = np.linspace(0, K, 9).astype(int)
+    L = 10 * np.log10(np.array([Ns[e[i]:e[i + 1]].mean(axis=0) for i in range(8)]) + 1e-14)
+    ns = float(L.std(axis=1).mean())            # 입력에서 직접 잰 시간 변동 폭(dB)
+    gate = min(max((ns - p["spp_ns0"]) / max(p["spp_ns_scale"], 1e-3), 0.0), 1.0)
+    w = w0 * gate
+    return np.exp((1 - w) * np.log(N0) + w * np.log(np.maximum(Ns, 1e-14)))
 
 
 def _tonal_suppress(x, sr, thr_db, max_cut_db, max_peaks):

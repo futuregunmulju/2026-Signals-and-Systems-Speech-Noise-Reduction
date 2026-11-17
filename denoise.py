@@ -57,6 +57,7 @@ DEFAULTS = dict(
     h_fmax=2500.0,
     spp_w=0.0, spp_sigma=15.0, spp_xi_db=15.0, spp_alpha=0.8,
     spp_bias=1.0, spp_ns0=0.0, spp_ns_scale=1.0,
+    ensemble=None,   # 분석 창이 다른 여러 설정의 출력을 가중 평균 (None이면 단일 설정)
 )
 
 # 튜닝 결과(best_params.json)가 이 파일 옆에 있으면 자동으로 기본값에 반영
@@ -344,11 +345,24 @@ def denoise_channel(x, sr=16000, **overrides):
     return np.nan_to_num(y)
 
 
-def denoise(x, sr=16000, **overrides):
-    x = np.asarray(x, dtype=np.float64)
+def _denoise_single(x, sr, overrides):
     if x.ndim == 1:
         return denoise_channel(x, sr, **overrides)
     return np.stack([denoise_channel(x[:, c], sr, **overrides) for c in range(x.shape[1])], axis=1)
+
+
+def denoise(x, sr=16000, **overrides):
+    x = np.asarray(x, dtype=np.float64)
+    members = overrides.pop("ensemble", DEFAULTS.get("ensemble"))
+    if not members:
+        return _denoise_single(x, sr, overrides)
+    acc, wsum = 0.0, 0.0
+    for m in members:
+        m = dict(m)
+        w = float(m.pop("w", 1.0))
+        acc = acc + w * _denoise_single(x, sr, {**overrides, **m})
+        wsum += w
+    return acc / wsum
 
 
 def main():
